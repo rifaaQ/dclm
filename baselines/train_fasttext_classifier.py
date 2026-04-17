@@ -35,7 +35,7 @@ def get_args():
     parser = argparse.ArgumentParser(description="Train fasttext classifiers for quality prediction.")
     parser.add_argument("--input", help="Training file for fasttext classifier (in fasttext format).", required=True)
     parser.add_argument("--valid_input", help='Data file for validating fasttext classifier', type=str)
-    parser.add_argument("--valid_frac", help='Holdout ratio for validation. Will split from the training data.', type=float, default=0)
+    parser.add_argument("--valid_frac", help='Holdout ratio for validation. Will split from the training data.', type=float, default=0.1    )
     parser.add_argument("--output_dir", help="Output dir at which to save the model binary.", default="./mappers/enrichers/quality_prediction_enrichment_models/")
     parser.add_argument("--name", required=True, help="Name of the model to save.")
     parser.add_argument("--seed", help="Random seed", type=int, default=42)
@@ -77,6 +77,7 @@ def main():
         print_results(*model.test(valid_input))
 
     # Save the model
+    os.makedirs(args.output_dir, exist_ok=True)
     output = args.name if args.name.endswith(".bin") else args.name + ".bin"
     model.save_model(os.path.join(args.output_dir, output))
 
