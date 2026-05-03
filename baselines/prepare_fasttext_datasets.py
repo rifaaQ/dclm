@@ -13,13 +13,20 @@ LQ_LABEL = "__label__cc"
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Prepare fastText training files for two quality classifiers: "
-            "MMLU vs RefinedWeb and MMLU vs DCLM."
+            "Prepare fastText training files for quality classifiers, including "
+            "DCLM vs benchmark datasets."
         )
     )
-    parser.add_argument("--mmlu_input", required=True, help="Path to MMLU file or directory.")
-    parser.add_argument("--refinedweb_input", required=True, help="Path to RefinedWeb file or directory.")
-    parser.add_argument("--dclm_input", required=True, help="Path to DCLM file or directory.")
+    parser.add_argument("--mmlu_input", help="Path to MMLU file or directory.")
+    parser.add_argument("--refinedweb_input", help="Path to RefinedWeb file or directory.")
+    parser.add_argument("--dclm_input", help="Path to DCLM file or directory.")
+    parser.add_argument("--coconot_input", help="Path to Coconot JSONL file or directory.")
+    parser.add_argument("--all_benchmark_input", help="Path to all_benchmark JSONL file or directory.")
+    parser.add_argument("--all_mmlu_input", help="Path to all_mmlu JSONL file or directory.")
+    parser.add_argument("--hellaswag_input", help="Path to HellaSwag JSONL file or directory.")
+    parser.add_argument("--hq_input", help="Path to a generic high-quality/class-positive file or directory.")
+    parser.add_argument("--cc_input", help="Path to a generic Common Crawl/class-negative file or directory.")
+    parser.add_argument("--pair_name", help="Output basename for --hq_input/--cc_input, without .txt.")
     parser.add_argument(
         "--output_dir",
         default="./data/fasttext",
@@ -43,6 +50,26 @@ def get_args() -> argparse.Namespace:
         help="Preferred text field when reading JSONL (fallbacks are used automatically).",
     )
     parser.add_argument(
+        "--coconot_text_field",
+        default="model_input",
+        help="Preferred text field for Coconot JSONL records.",
+    )
+    parser.add_argument(
+        "--benchmark_text_field",
+        default="text",
+        help="Preferred text field for benchmark JSONL records.",
+    )
+    parser.add_argument(
+        "--hq_text_field",
+        default="text",
+        help="Preferred text field for --hq_input records.",
+    )
+    parser.add_argument(
+        "--cc_text_field",
+        default="text",
+        help="Preferred text field for --cc_input records.",
+    )
+    parser.add_argument(
         "--min_chars",
         type=int,
         default=10,
@@ -55,7 +82,7 @@ def get_args() -> argparse.Namespace:
 def _extract_text_from_json(obj: dict, preferred_field: str) -> Optional[str]:
     if preferred_field in obj and isinstance(obj[preferred_field], str):
         return obj[preferred_field]
-    for field in ("text", "content", "body", "raw_content", "document"):
+    for field in ("text", "model_input", "content", "body", "raw_content", "document"):
         if field in obj and isinstance(obj[field], str):
             return obj[field]
     return None
@@ -159,6 +186,7 @@ def _flatten_to_text(value: object) -> str:
             "input",
             "output",
             "text",
+            "model_input",
             "content",
             "body",
             "raw_content",
@@ -181,6 +209,11 @@ def _flatten_to_text(value: object) -> str:
 
 
 def _extract_text_from_record(record: dict, preferred_field: str) -> Optional[str]:
+    if preferred_field != "text":
+        direct_text = _extract_text_from_json(record, preferred_field)
+        if direct_text:
+            return direct_text
+
     canonical = _record_to_mmlu_canonical_text(record)
     if canonical:
         return canonical
@@ -366,35 +399,130 @@ def build_dataset(
     print(f"[{dataset_name}] valid rows: {len(valid_lines)} -> {valid_path}")
 
 
+def build_single_file_dataset(
+    hq_texts: List[str],
+    lq_texts: List[str],
+    dataset_name: str,
+    output_dir: str,
+    rng: random.Random,
+) -> None:
+    n = min(len(hq_texts), len(lq_texts))
+    if n == 0:
+        raise ValueError(f"Dataset {dataset_name} has no usable examples after filtering.")
+
+    hq_sample = list(hq_texts)
+    lq_sample = list(lq_texts)
+    rng.shuffle(hq_sample)
+    rng.shuffle(lq_sample)
+    hq_sample = hq_sample[:n]
+    lq_sample = lq_sample[:n]
+
+    all_lines = to_labeled_lines(hq_sample, HQ_LABEL) + to_labeled_lines(lq_sample, LQ_LABEL)
+    rng.shuffle(all_lines)
+
+    output_path = os.path.join(output_dir, f"{dataset_name}.txt")
+    write_lines(output_path, all_lines)
+
+    print(f"[{dataset_name}] balanced per class: {n}")
+    print(f"[{dataset_name}] rows: {len(all_lines)} -> {output_path}")
+
+
 def main() -> None:
     args = get_args()
+    benchmark_inputs = [
+        ("dclm_vs_all_benchmark", args.all_benchmark_input),
+        ("dclm_vs_all_mmlu", args.all_mmlu_input),
+        ("dclm_vs_hellaswag", args.hellaswag_input),
+    ]
+    requested_benchmarks = [(name, path) for name, path in benchmark_inputs if path]
+    requested_generic_pair = args.hq_input or args.cc_input or args.pair_name
+    requested_mmlu_comparisons = args.refinedweb_input or args.coconot_input or (
+        args.dclm_input and not requested_benchmarks and not requested_generic_pair
+    )
+
+    if requested_generic_pair and not (args.hq_input and args.cc_input and args.pair_name):
+        raise ValueError("Provide --hq_input, --cc_input, and --pair_name together.")
+    if requested_mmlu_comparisons and not args.mmlu_input:
+        raise ValueError("Provide --mmlu_input when building MMLU comparison datasets.")
+    if requested_benchmarks and not args.dclm_input:
+        raise ValueError("Provide --dclm_input when building DCLM vs benchmark datasets.")
+    if not (requested_mmlu_comparisons or requested_benchmarks or requested_generic_pair):
+        raise ValueError(
+            "Provide inputs for at least one dataset: --refinedweb_input, --coconot_input, "
+            "--all_benchmark_input, --all_mmlu_input, --hellaswag_input, or "
+            "--hq_input/--cc_input/--pair_name."
+        )
+
     rng = random.Random(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    mmlu_texts = load_texts(args.mmlu_input, args.text_field, args.min_chars, args.max_per_source)
-    refinedweb_texts = load_texts(args.refinedweb_input, args.text_field, args.min_chars, args.max_per_source)
-    dclm_texts = load_texts(args.dclm_input, args.text_field, args.min_chars, args.max_per_source)
+    mmlu_texts: List[str] = []
+    if requested_mmlu_comparisons:
+        mmlu_texts = load_texts(args.mmlu_input, args.text_field, args.min_chars, args.max_per_source)
+        print(f"Loaded MMLU rows: {len(mmlu_texts)}")
 
-    print(f"Loaded MMLU rows: {len(mmlu_texts)}")
-    print(f"Loaded RefinedWeb rows: {len(refinedweb_texts)}")
-    print(f"Loaded DCLM rows: {len(dclm_texts)}")
+    if args.refinedweb_input:
+        refinedweb_texts = load_texts(args.refinedweb_input, args.text_field, args.min_chars, args.max_per_source)
+        print(f"Loaded RefinedWeb rows: {len(refinedweb_texts)}")
+        build_dataset(
+            hq_texts=mmlu_texts,
+            lq_texts=refinedweb_texts,
+            dataset_name="mmlu_vs_refinedweb",
+            output_dir=args.output_dir,
+            valid_frac=args.valid_frac,
+            rng=rng,
+        )
 
-    build_dataset(
-        hq_texts=mmlu_texts,
-        lq_texts=refinedweb_texts,
-        dataset_name="mmlu_vs_refinedweb",
-        output_dir=args.output_dir,
-        valid_frac=args.valid_frac,
-        rng=rng,
-    )
-    build_dataset(
-        hq_texts=mmlu_texts,
-        lq_texts=dclm_texts,
-        dataset_name="mmlu_vs_dclm",
-        output_dir=args.output_dir,
-        valid_frac=args.valid_frac,
-        rng=rng,
-    )
+    if args.dclm_input and requested_mmlu_comparisons and not requested_benchmarks:
+        dclm_texts = load_texts(args.dclm_input, args.text_field, args.min_chars, args.max_per_source)
+        print(f"Loaded DCLM rows: {len(dclm_texts)}")
+        build_dataset(
+            hq_texts=mmlu_texts,
+            lq_texts=dclm_texts,
+            dataset_name="mmlu_vs_dclm",
+            output_dir=args.output_dir,
+            valid_frac=args.valid_frac,
+            rng=rng,
+        )
+
+    if requested_benchmarks:
+        dclm_texts = load_texts(args.dclm_input, args.text_field, args.min_chars, args.max_per_source)
+        print(f"Loaded DCLM rows: {len(dclm_texts)}")
+        for dataset_name, input_path in requested_benchmarks:
+            benchmark_texts = load_texts(input_path, args.benchmark_text_field, args.min_chars, args.max_per_source)
+            print(f"Loaded {dataset_name.removeprefix('dclm_vs_')} rows: {len(benchmark_texts)}")
+            build_single_file_dataset(
+                hq_texts=benchmark_texts,
+                lq_texts=dclm_texts,
+                dataset_name=dataset_name,
+                output_dir=args.output_dir,
+                rng=rng,
+            )
+
+    if requested_generic_pair:
+        hq_texts = load_texts(args.hq_input, args.hq_text_field, args.min_chars, args.max_per_source)
+        cc_texts = load_texts(args.cc_input, args.cc_text_field, args.min_chars, args.max_per_source)
+        print(f"Loaded generic hq rows: {len(hq_texts)}")
+        print(f"Loaded generic cc rows: {len(cc_texts)}")
+        build_single_file_dataset(
+            hq_texts=hq_texts,
+            lq_texts=cc_texts,
+            dataset_name=args.pair_name,
+            output_dir=args.output_dir,
+            rng=rng,
+        )
+
+    if args.coconot_input:
+        coconot_texts = load_texts(args.coconot_input, args.coconot_text_field, args.min_chars, args.max_per_source)
+        print(f"Loaded Coconot rows: {len(coconot_texts)}")
+        build_dataset(
+            hq_texts=mmlu_texts,
+            lq_texts=coconot_texts,
+            dataset_name="mmlu_vs_coconot",
+            output_dir=args.output_dir,
+            valid_frac=args.valid_frac,
+            rng=rng,
+        )
 
 
 if __name__ == "__main__":
